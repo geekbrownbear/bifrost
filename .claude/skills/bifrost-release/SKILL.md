@@ -32,7 +32,28 @@ Report: any uncommitted changes, how many commits ahead of origin.
 
 **If tests fail:** show the failures and stop. Do not push until they pass.
 
-### 3. Summarize commits since last release
+### 3. Documentation freshness check
+
+Run the helper script — it compares last-commit timestamps on `bifrost` vs `bifrost-integrations-docs` and lists any user-facing files changed since docs were last updated:
+
+```bash
+./scripts/release/check-docs-freshness.sh
+```
+
+Exit codes:
+
+- `0` — docs are current (at or ahead of bifrost, OR no user-facing surface-area changes). Proceed.
+- `1` — drift detected. Surface to the user with the script's output:
+
+  > "Docs were last updated `<DOCS_LAST>`, bifrost main has moved since (`<N>` commits, `<M>` user-facing files touched — see list above). Want me to run the **bifrost-documentation** skill in `diff` mode before pushing? It'll re-capture screenshots for any pages whose source globs changed and open a docs PR."
+
+  If yes, invoke the `bifrost-documentation` skill (`diff` mode) and wait for the docs PR before continuing. If no, note it and proceed.
+
+- `2` — error (missing docs repo). The script prints the clone command. Run it and re-run the check.
+
+The script's `USER_FACING_PATTERNS` array is the source of truth for what counts as user-facing — when adding new dirs that affect docs/screenshots (e.g., a new public router, a new MCP-tool family), update that list.
+
+### 4. Summarize commits since last release
 
 ```bash
 git describe --tags --abbrev=0 2>/dev/null || echo "no-prior-tag"
@@ -54,13 +75,13 @@ Present the summary as:
 > - `<sha>` `<message>`
 > - ...
 
-### 4. Push
+### 5. Push
 
 ```bash
 git push origin main
 ```
 
-### 5. Tell the user what happens next
+### 6. Tell the user what happens next
 
 > "Pushed. CI will now:
 > 1. Run **unit tests** (fast ~2 min) — if they pass:
@@ -87,6 +108,22 @@ For a named version — creates a GitHub Release, tags `:latest`, and sets the b
 Ask: "What version? (current git describe: run `git describe --tags --always`)"
 
 The tag must start with `v` — e.g., `v2.1.0`.
+
+### 1b. Documentation freshness check (REQUIRED for full release)
+
+A versioned release should ship with current docs. Run:
+
+```bash
+./scripts/release/check-docs-freshness.sh
+```
+
+For a **full release**, always offer to dispatch the `bifrost-documentation` skill (`diff` mode) before tagging — even if the script returns 0, screenshots can drift in subtle ways (theme tweaks, copy changes) that the timestamp comparison won't catch. Frame it:
+
+> "Docs were last updated `<DOCS_LAST>`. Before I cut `<tag>`, want me to run **bifrost-documentation** in `diff` mode to refresh anything that drifted? This opens a separate docs PR; we can tag bifrost in parallel."
+
+If the user opts in, invoke that skill and let it run (the docs PR is independent of the bifrost tag). If they decline, note it explicitly and continue.
+
+If the script exits `2` (missing docs repo), follow its instructions to clone before proceeding.
 
 ### 2. Summarize commits since last release
 
@@ -204,6 +241,32 @@ gh release edit <tag> --notes-file /tmp/release-notes-<tag>.md
 > CLI users on `:latest` will automatically get the new version next `pipx install`.
 >
 > Watch CI: https://github.com/jackmusick/bifrost/actions"
+
+### 6. Offer to draft a blog post (gobifrost `/blog` skill)
+
+Versioned releases get a companion announcement on https://gobifrost.com. The drafting logic lives in the **gobifrost repo's `/blog` skill** at `~/GitHub/gobifrost/.claude/skills/blog/SKILL.md` — that skill owns voice samples, frontmatter shape, slug conventions, and asset-path patterns.
+
+Ask the user:
+
+> "Want me to draft a companion blog post for `<tag>`? It'll be a themed narrative on a draft branch — you edit the prose and add screenshots before publishing."
+
+**If they decline:** stop here. Release is done.
+
+**If they accept:** gobifrost is a separate repo and isn't auto-loaded as a workspace in this bifrost session, so the Skill tool can't invoke it directly. Read the skill file and follow it inline:
+
+```bash
+cat ~/GitHub/gobifrost/.claude/skills/blog/SKILL.md
+```
+
+If the file is missing, the gobifrost checkout is stale or absent — `git clone git@github.com:jackmusick/gobifrost.git ~/GitHub/gobifrost` (or `git pull` if it exists) and re-read.
+
+Pass to the skill as **inputs**:
+
+- **Source material:** the release notes you drafted in step 4b (themed groupings + headline). Drop the CVE list, Docker pulls, and verification commands — those don't belong in a blog post.
+- **Slug:** suggest something thematic, NOT version-numbered (the skill enforces this). If you can't think of one, ask the user.
+- **pubDate:** today.
+
+Follow the skill's workflow exactly — it handles preflight, voice-matching against existing posts, branch creation, scaffolding, anti-bloat self-review, and pushing the draft branch. **Do not open a PR.** The skill explicitly forbids it; the user iterates and ships manually.
 
 ---
 
