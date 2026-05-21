@@ -246,6 +246,7 @@ export function Applications() {
 				)}
 			</div>
 
+			<div className="flex-1 min-h-0 overflow-auto">
 			{isLoading ? (
 				viewMode === "grid" || !canManageApps ? (
 					<div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
@@ -630,6 +631,7 @@ export function Applications() {
 					</CardContent>
 				</Card>
 			)}
+			</div>
 
 			{/* Delete Confirmation Dialog */}
 			<AlertDialog
