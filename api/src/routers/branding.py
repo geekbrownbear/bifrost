@@ -16,7 +16,7 @@ from fastapi.responses import Response
 from shared.svg_sanitizer import SvgSanitizationError, sanitize_svg
 
 from src.models import BrandingSettings, BrandingTerminology, BrandingUpdateRequest, GlobalBranding
-from src.core.auth import Context, CurrentActiveUser
+from src.core.auth import Context, CurrentSuperuser
 from src.core.database import AsyncSession, get_db
 
 logger = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ async def get_branding(
 async def update_branding(
     request: BrandingUpdateRequest,
     ctx: Context,
-    user: CurrentActiveUser,
+    user: CurrentSuperuser,
 ) -> BrandingSettings:
     """
     Update primary color only.
@@ -95,11 +95,6 @@ async def update_branding(
     Only superusers can update global branding.
     Use POST /logo/{type} to upload logos.
     """
-    if not user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superusers can update branding",
-        )
 
     from src.repositories.branding import BrandingRepository
     branding_repo = BrandingRepository(ctx.db)
@@ -133,7 +128,7 @@ async def upload_logo(
     logo_type: str,
     file: Annotated[UploadFile, File(description="Logo image file")],
     ctx: Context,
-    user: CurrentActiveUser,
+    user: CurrentSuperuser,
 ) -> BrandingSettings:
     """
     Upload a logo file.
@@ -142,11 +137,6 @@ async def upload_logo(
         logo_type: 'square' or 'rectangle'
         file: Image file (PNG, JPEG, SVG)
     """
-    if not user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superusers can upload logos",
-        )
 
     if logo_type not in ("square", "rectangle"):
         raise HTTPException(
@@ -257,7 +247,7 @@ async def get_logo(logo_type: str, db: AsyncSession = Depends(get_db)):
 async def reset_logo(
     logo_type: str,
     ctx: Context,
-    user: CurrentActiveUser,
+    user: CurrentSuperuser,
 ) -> BrandingSettings:
     """
     Reset a specific logo to default.
@@ -265,11 +255,6 @@ async def reset_logo(
     Args:
         logo_type: 'square' or 'rectangle'
     """
-    if not user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superusers can reset logos",
-        )
 
     if logo_type not in ("square", "rectangle"):
         raise HTTPException(
@@ -306,14 +291,9 @@ async def reset_logo(
 )
 async def reset_color(
     ctx: Context,
-    user: CurrentActiveUser,
+    user: CurrentSuperuser,
 ) -> BrandingSettings:
     """Reset primary color to default."""
-    if not user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superusers can reset branding",
-        )
 
     from src.repositories.branding import BrandingRepository
     branding_repo = BrandingRepository(ctx.db)
@@ -335,15 +315,9 @@ async def reset_color(
 )
 async def reset_application_name(
     ctx: Context,
-    user: CurrentActiveUser,
+    user: CurrentSuperuser,
 ) -> BrandingSettings:
     """Reset application name to default."""
-    if not user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superusers can reset branding",
-        )
-
     from src.repositories.branding import BrandingRepository
     branding_repo = BrandingRepository(ctx.db)
 
@@ -364,14 +338,9 @@ async def reset_application_name(
 )
 async def reset_all_branding(
     ctx: Context,
-    user: CurrentActiveUser,
+    user: CurrentSuperuser,
 ) -> BrandingSettings:
     """Reset all branding to defaults."""
-    if not user.is_superuser:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superusers can reset branding",
-        )
 
     from src.repositories.branding import BrandingRepository
     branding_repo = BrandingRepository(ctx.db)

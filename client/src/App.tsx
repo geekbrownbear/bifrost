@@ -40,6 +40,14 @@ const Roles = lazyWithReload(() =>
 const RoleDetail = lazyWithReload(() =>
 	import("@/pages/RoleDetail").then((m) => ({ default: m.RoleDetail })),
 );
+const Solutions = lazyWithReload(() =>
+	import("@/pages/Solutions").then((m) => ({ default: m.Solutions })),
+);
+const SolutionDetail = lazyWithReload(() =>
+	import("@/pages/SolutionDetail").then((m) => ({
+		default: m.SolutionDetail,
+	})),
+);
 const Users = lazyWithReload(() =>
 	import("@/pages/Users").then((m) => ({ default: m.Users })),
 );
@@ -422,6 +430,24 @@ function AppRoutes() {
 							element={
 								<ProtectedRoute requirePlatformAdmin>
 									<RoleDetail />
+								</ProtectedRoute>
+							}
+						/>
+
+						{/* Solutions - PlatformAdmin only */}
+						<Route
+							path="solutions"
+							element={
+								<ProtectedRoute requirePlatformAdmin>
+									<Solutions />
+								</ProtectedRoute>
+							}
+						/>
+						<Route
+							path="solutions/:solutionId"
+							element={
+								<ProtectedRoute requirePlatformAdmin>
+									<SolutionDetail />
 								</ProtectedRoute>
 							}
 						/>
