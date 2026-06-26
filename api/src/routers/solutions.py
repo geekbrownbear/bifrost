@@ -14,17 +14,22 @@ import base64
 import json
 import logging
 import os
+import re
+import tempfile
 import zipfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Body, File, HTTPException, Response, UploadFile, status
 from fastapi import Form as FastapiForm
-from sqlalchemy import select, update
+from fastapi.responses import FileResponse, StreamingResponse
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
+from starlette.background import BackgroundTask
 
 from src.core.auth import Context, CurrentSuperuser
 from src.models.contracts.solutions import (
@@ -35,13 +40,19 @@ from src.models.contracts.solutions import (
     SolutionConfigStatus,
     SolutionCreate,
     SolutionDeleteSummary,
+    SolutionDeletionSummary,
+    SolutionEntityCounts,
     SolutionDependencyPreview,
     SolutionDependencyPreviewRequest,
     SolutionDeployEnqueued,
     SolutionDeployJobStatus,
     SolutionEntities,
     SolutionEntitySummary,
+    SolutionFileSummary,
     SolutionExistingInstall,
+    SolutionExportJobCreate,
+    SolutionExportJobPublic,
+    SolutionExportJobsList,
     SolutionInstallPreview,
     PullAckRequest,
     PullAckResponse,
@@ -57,9 +68,11 @@ from src.models.orm.agents import Agent
 from src.models.orm.applications import Application
 from src.models.orm.config import Config
 from src.models.orm.custom_claims import CustomClaim
+from src.models.orm.file_metadata import FileMetadata
 from src.models.orm.forms import Form
 from src.models.orm.solution_config_schema import SolutionConfigSchema
 from src.models.orm.solution_deploy_jobs import SolutionDeployJob
+from src.models.orm.solution_export_jobs import SolutionExportJob
 from src.models.orm.solutions import Solution as SolutionORM
 from src.models.orm.tables import Table
 from src.models.orm.workflows import Workflow
@@ -68,6 +81,11 @@ from src.services.solutions.deploy import (
     SolutionDowngradeBlocked,
     SolutionFinalizeIncomplete,
     SolutionWorkflowNameMismatch,
+)
+from src.services.solutions.export_jobs import (
+    create_export_job,
+    list_export_jobs,
+    public_job,
 )
 
 if TYPE_CHECKING:
@@ -78,6 +96,34 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/solutions", tags=["Solutions"])
 
 DEPLOY_JOB_ORPHAN_THRESHOLD = timedelta(minutes=15)
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+_ZIP_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _cleanup_file(path: str | Path) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 - best-effort response cleanup
+        logger.warning("Failed to remove temporary file %s", path)
+
+
+def _safe_zip_filename(filename: str) -> str:
+    stem = filename.removesuffix(".zip")
+    safe_stem = _ZIP_FILENAME_SAFE_RE.sub("-", stem).strip(".-_")
+    return f"{safe_stem or 'solution-export'}.zip"
+
+
+async def _spool_upload_to_temp(file: UploadFile, *, prefix: str) -> Path:
+    tmp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".zip", delete=False)
+    path = Path(tmp.name)
+    try:
+        with tmp:
+            while chunk := await file.read(UPLOAD_CHUNK_SIZE):
+                tmp.write(chunk)
+    except Exception:
+        _cleanup_file(path)
+        raise
+    return path
 
 
 async def reconcile_orphaned_deploy_jobs(
@@ -144,10 +190,52 @@ async def create_solution(body: SolutionCreate, ctx: Context, user: CurrentSuper
     return SolutionDTO.model_validate(row)
 
 
+async def _count_by_solution(ctx: Context, model: type, solution_ids: list[UUID]) -> dict[UUID, int]:
+    if not solution_ids:
+        return {}
+    rows = await ctx.db.execute(
+        select(model.solution_id, func.count())  # type: ignore[attr-defined]
+        .where(model.solution_id.in_(solution_ids))  # type: ignore[attr-defined]
+        .group_by(model.solution_id)  # type: ignore[attr-defined]
+    )
+    return {solution_id: int(count) for solution_id, count in rows.all() if solution_id is not None}
+
+
+async def _solution_entity_counts(
+    ctx: Context, solution_ids: list[UUID]
+) -> dict[UUID, SolutionEntityCounts]:
+    counts = {
+        solution_id: SolutionEntityCounts()
+        for solution_id in solution_ids
+    }
+    for attr, model in (
+        ("workflows", Workflow),
+        ("apps", Application),
+        ("forms", Form),
+        ("agents", Agent),
+        ("tables", Table),
+        ("claims", CustomClaim),
+        ("files", FileMetadata),
+    ):
+        by_solution = await _count_by_solution(ctx, model, solution_ids)
+        for solution_id, count in by_solution.items():
+            setattr(counts[solution_id], attr, count)
+    return counts
+
+
 @router.get("", response_model=SolutionsList, summary="List Solution installs (admin only)")
 async def list_solutions(ctx: Context, user: CurrentSuperuser) -> SolutionsList:
     rows = (await ctx.db.execute(select(SolutionORM).order_by(SolutionORM.slug))).scalars().all()
-    return SolutionsList(solutions=[SolutionDTO.model_validate(r) for r in rows])
+    ids = [row.id for row in rows]
+    counts = await _solution_entity_counts(ctx, ids)
+    return SolutionsList(
+        solutions=[
+            SolutionDTO.model_validate(row).model_copy(
+                update={"entity_counts": counts.get(row.id, SolutionEntityCounts())}
+            )
+            for row in rows
+        ]
+    )
 
 
 @router.get("/{solution_id}", response_model=SolutionDTO, summary="Get a Solution install (admin only)")
@@ -264,6 +352,8 @@ async def export_solution(
     ctx: Context,
     user: CurrentSuperuser,
     mode: str = "shareable",
+    include_values: bool | None = None,
+    include_files: bool | None = None,
     include_data: bool = False,
     password: Annotated[str | None, Body(embed=True)] = None,
 ) -> Response:
@@ -273,35 +363,42 @@ async def export_solution(
 
     This is a POST (not GET) specifically so the full-backup ``password`` rides
     in the request BODY rather than the URL query string — a query-string secret
-    leaks into access logs, proxies, and browser history. ``mode`` and
-    ``include_data`` stay in the query (they are not sensitive).
+    leaks into access logs, proxies, and browser history. ``mode`` and the
+    backup-content flags stay in the query (they are not sensitive).
 
-    ``mode=shareable`` (default): portable export, no sensitive values.
-    ``mode=full``: includes an encrypted ``.bifrost/secrets.enc`` blob carrying
-    the config values set for this install; requires ``password`` (in the body).
-    ``include_data=true``: include table row data in the encrypted blob.
-    Requires ``mode=full`` (data must be encrypted).
+    ``mode=shareable`` (default): portable export, no runtime values.
+    ``mode=full``: backup export. ``include_values`` controls config/secret
+    values, ``include_files`` controls Solution-owned file payloads, and
+    ``include_data`` controls table row data. A password is required whenever a
+    backup payload is requested.
     """
     if mode not in ("shareable", "full"):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="mode must be 'shareable' or 'full'",
         )
-    if mode == "full" and not password:
+
+    include_values_flag = mode == "full" if include_values is None else include_values
+    # Back-compat: old callers only had include_data; keep that as "include
+    # all large runtime data" unless include_files is sent explicitly.
+    include_files_flag = include_data if include_files is None else include_files
+    wants_backup_payload = include_values_flag or include_files_flag or include_data
+
+    if mode == "shareable" and wants_backup_payload:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="full export requires a password",
+            detail="backup content options require mode=full",
         )
-    if include_data and mode != "full":
+    if mode == "full" and wants_backup_payload and not password:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="include_data requires mode=full (data must be encrypted)",
+            detail="backup export requires a password",
         )
 
     from src.services.solutions.capture import SolutionCaptureService
     from src.services.solutions.export import (
-        add_encrypted_content_to_workspace_zip,
-        build_workspace_zip,
+        add_live_content_to_workspace_zip_file,
+        build_workspace_zip_for_export,
     )
     from src.services.solutions.source_artifact import SolutionSourceArtifactStorage
 
@@ -309,33 +406,205 @@ async def export_solution(
     if sol is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solution not found")
 
-    include_values = mode == "full"
-    stored_source = await SolutionSourceArtifactStorage(solution_id).read()
-    if stored_source is not None and mode == "shareable":
-        data = stored_source
-    else:
-        bundle = await SolutionCaptureService(ctx.db).bundle_for(
-            sol,
-            include_imports=True,
-            include_values=include_values,
-            include_data=include_data,
+    artifact = SolutionSourceArtifactStorage(solution_id)
+    filename = _safe_zip_filename(f"{sol.slug}-{sol.version or 'unversioned'}.zip")
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="bifrost-solution-export-",
+        suffix=".zip",
+        delete=False,
+    )
+    out_path = Path(tmp.name)
+    tmp.close()
+    source_path: Path | None = None
+    try:
+        stored_source_path = tempfile.NamedTemporaryFile(
+            prefix="bifrost-solution-source-",
+            suffix=".zip",
+            delete=False,
         )
-        if stored_source is not None:
-            from src.services.solutions.secrets_blob import SolutionContent
-
-            data = add_encrypted_content_to_workspace_zip(
-                stored_source,
-                SolutionContent(
-                    config_values=bundle.config_values,
-                    table_data=bundle.table_data,
-                ),
-                password=password or "",
-            )
+        source_path = Path(stored_source_path.name)
+        stored_source_path.close()
+        has_stored_source = await artifact.copy_to_path(source_path)
+        if has_stored_source and mode == "shareable":
+            source_path.replace(out_path)
         else:
-            data = build_workspace_zip(bundle, password=password if include_values else None)
-    filename = f"{sol.slug}-{sol.version or 'unversioned'}.zip"
-    return Response(
-        content=data,
+            bundle = await SolutionCaptureService(ctx.db).bundle_for(
+                sol,
+                include_imports=True,
+                include_values=include_values_flag,
+                include_data=include_data,
+                include_files=include_files_flag,
+            )
+            if has_stored_source:
+                await add_live_content_to_workspace_zip_file(
+                    source_path,
+                    bundle,
+                    ctx.db,
+                    out_path,
+                    password=password or "",
+                )
+            else:
+                await build_workspace_zip_for_export(
+                    bundle,
+                    ctx.db,
+                    out_path,
+                    password=password if wants_backup_payload else None,
+                )
+        _cleanup_file(source_path)
+        # Commit the SolutionConnectionSchema rows that _connection_entries
+        # upserts as a side-effect of a fresh _repo/ scan. Without this the only
+        # commit is get_db()'s teardown, which FastAPI runs AFTER the FileResponse
+        # body is streamed — so a caller that queries these rows right after the
+        # response races the commit (flaky under load), and a deferred-commit
+        # failure would silently drop the persisted declarations. Every other
+        # mutating endpoint in this router commits explicitly; match that.
+        await ctx.db.commit()
+    except Exception:
+        _cleanup_file(out_path)
+        if source_path is not None:
+            _cleanup_file(source_path)
+        raise
+    return FileResponse(
+        out_path,
+        media_type="application/zip",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        background=BackgroundTask(_cleanup_file, out_path),
+    )
+
+
+@router.post(
+    "/{solution_id}/export-jobs",
+    response_model=SolutionExportJobPublic,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue a durable Solution backup export job (admin only)",
+)
+async def create_solution_export_job(
+    solution_id: UUID,
+    body: SolutionExportJobCreate,
+    ctx: Context,
+    user: CurrentSuperuser,
+) -> SolutionExportJobPublic:
+    """Create a scheduler-owned backup export job without building the zip."""
+    from src.models.contracts.notifications import (
+        NotificationCategory,
+        NotificationCreate,
+    )
+    from src.services.notification_service import get_notification_service
+
+    sol = await ctx.db.get(SolutionORM, solution_id)
+    if sol is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solution not found")
+
+    try:
+        created = await create_export_job(ctx.db, sol, user.user_id, body.options)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        notification = await get_notification_service().create_notification(
+            str(user.user_id),
+            NotificationCreate(
+                category=NotificationCategory.SYSTEM,
+                title="Backup queued",
+                description="Solution backup export is queued.",
+                percent=0,
+                metadata={
+                    "solution_id": str(solution_id),
+                    "job_id": str(created.id),
+                    "action": "download_solution_export",
+                    "action_label": "Download",
+                },
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - Redis/notification outage
+        await ctx.db.rollback()
+        logger.exception("Failed to create Solution export notification")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to create export notification",
+        ) from exc
+
+    row = await ctx.db.get(SolutionExportJob, created.id)
+    if row is None:
+        await ctx.db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Export job was not persisted",
+        )
+    row.notification_id = UUID(notification.id)
+    await ctx.db.commit()
+    await ctx.db.refresh(row)
+    return public_job(row)
+
+
+@router.get(
+    "/{solution_id}/export-jobs",
+    response_model=SolutionExportJobsList,
+    summary="List durable Solution backup export jobs (admin only)",
+)
+async def get_solution_export_jobs(
+    solution_id: UUID,
+    ctx: Context,
+    user: CurrentSuperuser,
+) -> SolutionExportJobsList:
+    sol = await ctx.db.get(SolutionORM, solution_id)
+    if sol is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solution not found")
+    return SolutionExportJobsList(jobs=await list_export_jobs(ctx.db, solution_id))
+
+
+@router.get(
+    "/export-jobs/{job_id}",
+    response_model=SolutionExportJobPublic,
+    summary="Get a durable Solution backup export job (admin only)",
+)
+async def get_solution_export_job(
+    job_id: UUID,
+    ctx: Context,
+    user: CurrentSuperuser,
+) -> SolutionExportJobPublic:
+    row = await ctx.db.get(SolutionExportJob, job_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export job not found")
+    return public_job(row)
+
+
+@router.get(
+    "/export-jobs/{job_id}/download",
+    summary="Download a completed durable Solution backup export artifact (admin only)",
+    responses={
+        200: {"content": {"application/zip": {}}},
+        404: {"description": "Export job not found"},
+        409: {"description": "Export job is not downloadable"},
+    },
+)
+async def download_solution_export_job(
+    job_id: UUID,
+    ctx: Context,
+    user: CurrentSuperuser,
+) -> StreamingResponse:
+    from src.services.file_storage import FileStorageService
+
+    row = await ctx.db.get(SolutionExportJob, job_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export job not found")
+    if (
+        row.status != "completed"
+        or not row.artifact_storage_key
+        or public_job(row).download_url is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Export job is not downloadable",
+        )
+
+    filename = _safe_zip_filename(row.artifact_filename or f"solution-export-{row.id}.zip")
+    return StreamingResponse(
+        FileStorageService(ctx.db).iter_raw_s3_chunks(row.artifact_storage_key),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
@@ -356,12 +625,19 @@ async def get_solution_entities(
     if sol is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solution not found")
 
+    from src.services.solution_files import enumerate_solution_files
+
     workflows = await _workflow_summaries(ctx, Workflow.solution_id == solution_id)
     apps = await _app_summaries(ctx, Application.solution_id == solution_id)
     forms = await _form_summaries(ctx, Form.solution_id == solution_id)
     agents = await _agent_summaries(ctx, Agent.solution_id == solution_id)
     claims = await _claim_summaries(ctx, CustomClaim.solution_id == solution_id)
     tables = await _table_summaries(ctx, Table.solution_id == solution_id)
+    file_entries = await enumerate_solution_files(ctx.db, solution_id)
+    files = [
+        SolutionFileSummary(location=f.location, path=f.path, size=f.size)
+        for f in file_entries
+    ]
 
     decls = (
         await ctx.db.execute(
@@ -400,6 +676,7 @@ async def get_solution_entities(
         agents=agents,
         claims=claims,
         tables=tables,
+        files=files,
         configs=configs,
         required_configs_unset=required_unset,
     )
@@ -684,33 +961,106 @@ async def update_solution(
     return SolutionDTO.model_validate(sol)
 
 
+@router.post(
+    "/{solution_id}/uninstall",
+    response_model=SolutionDTO,
+    summary="Uninstall: flip status to inactive, data frozen in place (admin only)",
+)
+async def uninstall_solution(
+    solution_id: UUID, ctx: Context, user: CurrentSuperuser
+) -> SolutionDTO:
+    """Flip the install's lifecycle status to ``inactive``.
+
+    This is the NON-DESTRUCTIVE uninstall path. Owned entities (tables/workflows/
+    forms/agents/apps) stay exactly where they are, still owned by this install
+    (``solution_id`` is NOT cleared). No S3 ops. No data mutation of any kind.
+
+    An already-inactive install returns 200 unchanged (idempotent).
+
+    To permanently destroy an install and all of its owned data, use the hard-delete
+    path: ``DELETE /{id}?confirm=<slug>``.
+    """
+    sol = await ctx.db.get(SolutionORM, solution_id)
+    if sol is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solution not found")
+    await ctx.db.execute(
+        update(SolutionORM)
+        .where(SolutionORM.id == solution_id)
+        .values(status="inactive")
+    )
+    await ctx.db.commit()
+    await ctx.db.refresh(sol)
+    return SolutionDTO.model_validate(sol)
+
+
+@router.get(
+    "/{solution_id}/deletion-summary",
+    response_model=SolutionDeletionSummary,
+    summary="Preview counts of what a hard-delete would destroy (admin only)",
+)
+async def get_solution_deletion_summary(
+    solution_id: UUID, ctx: Context, user: CurrentSuperuser
+) -> SolutionDeletionSummary:
+    """Return per-entity counts of what ``DELETE /{id}?confirm=<slug>`` would destroy.
+
+    Intended for the confirmation modal: the UI fetches this, shows "you are about
+    to delete N tables, M workflows, …", then requires the operator to type the
+    install slug before issuing the hard-delete.
+    """
+    from src.models.orm.events import EventSource, EventSubscription
+    from src.services.solution_files import enumerate_solution_files
+
+    sol = await ctx.db.get(SolutionORM, solution_id)
+    if sol is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solution not found")
+
+    async def _count(model: type) -> int:
+        result = await ctx.db.execute(
+            select(func.count()).select_from(model).where(model.solution_id == solution_id)  # type: ignore[attr-defined]
+        )
+        return result.scalar_one()
+
+    file_entries = await enumerate_solution_files(ctx.db, solution_id)
+
+    return SolutionDeletionSummary(
+        solution_id=solution_id,
+        files=len(file_entries),
+        tables=await _count(Table),
+        workflows=await _count(Workflow),
+        apps=await _count(Application),
+        forms=await _count(Form),
+        agents=await _count(Agent),
+        claims=await _count(CustomClaim),
+        config_declarations=await _count(SolutionConfigSchema),
+        events=await _count(EventSource) + await _count(EventSubscription),
+    )
+
+
 @router.delete(
     "/{solution_id}",
     response_model=SolutionDeleteSummary,
-    summary="Delete an install and everything it owns (admin only)",
+    summary="Hard-delete an install and ALL owned data — irreversible (admin only)",
 )
 async def delete_solution(
-    solution_id: UUID, ctx: Context, user: CurrentSuperuser
+    solution_id: UUID,
+    ctx: Context,
+    user: CurrentSuperuser,
+    confirm: str = "",
 ) -> SolutionDeleteSummary:
-    """Delete an install non-destructively for customer data.
+    """Confirmed hard-delete: drops the Solution row and ALL owned entities.
 
-    Pure-code entities (workflows/apps/forms/agents) and the install's config
-    DECLARATIONS cascade away via the ``solution_id`` FK ``ondelete=CASCADE``.
-    Data-bearing entities are ORPHANED instead of cascaded:
+    **This is irreversible.** Every owned row (tables, workflows, forms, agents,
+    apps, claims, config declarations, events) is removed via the existing
+    ``solution_id ondelete=CASCADE`` FKs when the Solution row is deleted.
+    The ``solutions/{id}/`` S3 prefix is swept after the DB commit.
 
-    - Owned tables are DETACHED before the Solution delete (``solution_id`` set
-      to NULL so the cascade can't reach them) and survive as ordinary org
-      tables. Their documents are untouched — they hang off the surviving table.
-    - The install's config VALUES (Config rows in the install's org scope whose
-      key matches a declaration) are stamped with orphan provenance and survive
-      (Config has no ``solution_id`` FK, so they were never cascade-tied).
+    Requires ``?confirm=<slug>`` equal to the install's slug. A mismatch returns
+    422 immediately — nothing is touched.
 
-    Both carry ``origin_solution_slug``/``origin_solution_id``/``orphaned_at`` so
-    a reinstall can reattach them. The install's S3 artifacts are swept. The git
-    repo is NEVER touched — a git-connected install is deletable; only the install
-    and its local artifacts go, the upstream repo is left alone.
+    To uninstall non-destructively (freeze data, flip status only), use:
+    ``POST /{id}/uninstall``.
     """
-    # Load WITHOUT eager-loading ``connection_schema`` (it is ``lazy="selectin"``).
+    # Load WITHOUT eager-loading selectin child relationships.
     # If the children are loaded, the relationship's ``delete-orphan`` cascade marks
     # them in ``session.deleted`` at flush and the Solutions read-only backstop
     # rejects them (drive F3). With ``noload`` the children are never loaded, so the
@@ -723,12 +1073,26 @@ async def delete_solution(
         await ctx.db.execute(
             select(SolutionORM)
             .where(SolutionORM.id == solution_id)
-            .options(noload(SolutionORM.connection_schema))
+            .options(
+                noload(SolutionORM.connection_schema),
+                noload(SolutionORM.file_locations),
+            )
         )
     ).scalar_one_or_none()
     if sol is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Solution not found")
 
+    # Server-side confirm: the caller must echo the install's slug.
+    if confirm != sol.slug:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"confirm mismatch: expected '{sol.slug}', got '{confirm}'. "
+                "Pass ?confirm=<slug> to confirm the hard-delete."
+            ),
+        )
+
+    from src.services.solution_files import enumerate_solution_files
     from src.services.solutions.app_build import SolutionAppBuilder
     from src.services.solutions.source_artifact import SolutionSourceArtifactStorage
     from src.services.solutions.storage import SolutionStorage
@@ -744,15 +1108,12 @@ async def delete_solution(
             # Count + collect app ids BEFORE the cascade delete — for the summary
             # and the S3 app-dist sweep (the rows are gone after the delete).
             async def _count(model: type) -> int:
-                return len(
-                    (
-                        await ctx.db.execute(
-                            select(model.id).where(model.solution_id == solution_id)
-                        )
-                    ).scalars().all()
+                result = await ctx.db.execute(
+                    select(func.count()).select_from(model).where(model.solution_id == solution_id)  # type: ignore[attr-defined]
                 )
+                return result.scalar_one()
 
-            app_ids = set(
+            app_ids = list(
                 (
                     await ctx.db.execute(
                         select(Application.id).where(
@@ -762,101 +1123,8 @@ async def delete_solution(
                 ).scalars().all()
             )
 
-            # Owned table ids (for the orphan count) — captured BEFORE we detach
-            # them, since the detach update clears ``solution_id``.
-            table_ids = set(
-                (
-                    await ctx.db.execute(
-                        select(Table.id).where(Table.solution_id == solution_id)
-                    )
-                ).scalars().all()
-            )
-
-            # The install's config DECLARATION keys — used both to count the
-            # cascaded declarations and to find the config VALUES to orphan.
-            decl_keys = set(
-                (
-                    await ctx.db.execute(
-                        select(SolutionConfigSchema.key).where(
-                            SolutionConfigSchema.solution_id == solution_id
-                        )
-                    )
-                ).scalars().all()
-            )
-
-            now = datetime.now(timezone.utc)
-
-            # DETACH TABLES (before the Solution delete so the FK cascade can't
-            # reach them). They survive as ordinary org tables; documents are
-            # untouched (they hang off the surviving table row).
-            await ctx.db.execute(
-                update(Table)
-                .where(Table.solution_id == solution_id)
-                .values(
-                    solution_id=None,
-                    organization_id=sol.organization_id,
-                    origin_solution_slug=sol.slug,
-                    origin_solution_id=sol.id,
-                    orphaned_at=now,
-                )
-            )
-
-            # STAMP CONFIG VALUES with orphan provenance (Config has no
-            # solution_id FK, so "detach" is just the tattoo — the row already
-            # survives the Solution delete). Match the install's declared keys in
-            # the install's org scope.
-            #
-            # KNOWN LIMITATION of the keyed-not-FK'd model: a Config VALUE is
-            # shared by key, so if another LIVE install in the same org declares
-            # the same key, that value backs both installs. We guard the common
-            # case by NOT orphaning keys still declared by another live install
-            # in this org (leaving the shared value live). The residual edge —
-            # two installs declaring the same key where only this one is being
-            # removed — is handled; a value mis-stamped despite the guard (e.g.
-            # an install added after a partial-failure) would need a manual
-            # un-orphan or a re-set in scope (which heals it).
-            config_values_orphaned = 0
-            still_declared_keys: set[str] = set()
-            if decl_keys:
-                org_match = (
-                    SolutionORM.organization_id == sol.organization_id
-                    if sol.organization_id is not None
-                    else SolutionORM.organization_id.is_(None)
-                )
-                still_declared_keys = set(
-                    (
-                        await ctx.db.execute(
-                            select(SolutionConfigSchema.key)
-                            .join(
-                                SolutionORM,
-                                SolutionConfigSchema.solution_id == SolutionORM.id,
-                            )
-                            .where(
-                                SolutionConfigSchema.solution_id != solution_id,
-                                SolutionConfigSchema.key.in_(decl_keys),
-                                org_match,
-                            )
-                        )
-                    ).scalars().all()
-                )
-
-            keys_to_orphan = decl_keys - still_declared_keys
-            if keys_to_orphan:
-                org_pred = (
-                    Config.organization_id == sol.organization_id
-                    if sol.organization_id is not None
-                    else Config.organization_id.is_(None)
-                )
-                result = await ctx.db.execute(
-                    update(Config)
-                    .where(org_pred, Config.key.in_(keys_to_orphan))
-                    .values(
-                        origin_solution_slug=sol.slug,
-                        origin_solution_id=sol.id,
-                        orphaned_at=now,
-                    )
-                )
-                config_values_orphaned = result.rowcount or 0
+            # Enumerate S3 files BEFORE the DB delete (file_metadata rows cascade away).
+            file_entries = await enumerate_solution_files(ctx.db, solution_id)
 
             summary = SolutionDeleteSummary(
                 solution_id=solution_id,
@@ -865,32 +1133,15 @@ async def delete_solution(
                 forms_deleted=await _count(Form),
                 agents_deleted=await _count(Agent),
                 claims_deleted=await _count(CustomClaim),
-                config_declarations_deleted=len(decl_keys),
-                tables_orphaned=len(table_ids),
-                config_values_orphaned=config_values_orphaned,
+                config_declarations_deleted=await _count(SolutionConfigSchema),
+                tables_deleted=await _count(Table),
+                files_swept=len(file_entries),
             )
 
-            # Capture the org before the delete — accessing attributes on a
-            # deleted+committed instance would trip an expired-attribute refresh.
-            sol_org_id = sol.organization_id
-
-            # Solution delete: cascades workflows/apps/forms/agents + the config
-            # DECLARATIONS. Tables already have solution_id=NULL, so they are NOT
-            # cascaded; config values were never FK-tied to the Solution.
+            # Hard-delete: the existing ondelete=CASCADE FKs remove all owned rows.
+            # No orphan/detach logic — this is the destructive path.
             await ctx.db.delete(sol)
             await ctx.db.commit()
-
-            # The orphan stamp is a Core UPDATE that does NOT go through
-            # set_config/upsert_config, so it never bumped the config cache.
-            # Without this, merged_for_sdk could keep serving the now-orphaned
-            # value (incl. a leftover SECRET) from Redis until TTL. Invalidate
-            # the install's org scope so runtime reads re-resolve against the DB.
-            if config_values_orphaned:
-                from src.core.cache import invalidate_all_config
-
-                await invalidate_all_config(
-                    str(sol_org_id) if sol_org_id is not None else None
-                )
 
             # S3 sweep only after the DB is durable (mirrors deploy's DB-then-S3).
             storage = SolutionStorage(solution_id)
@@ -911,7 +1162,7 @@ async def delete_solution(
 async def _run_deploy_job(
     job_id: UUID,
     solution_id: UUID,
-    zip_data: bytes,
+    zip_path: Path,
     *,
     force: bool,
 ) -> None:
@@ -927,7 +1178,7 @@ async def _run_deploy_job(
     from src.core.database import get_db_context
     from src.services.solutions.zip_install import (
         UnmetDependency,
-        deploy_zip_to_solution,
+        deploy_zip_to_solution_path,
     )
     from src.services.solutions.write_lock import (
         SolutionWriteLockHeld,
@@ -959,7 +1210,9 @@ async def _run_deploy_job(
                 if solution is None:
                     raise SolutionDeployConflict("Solution not found")
                 await _set_phase("parsing workspace zip and building app dist")
-                result = await deploy_zip_to_solution(db, solution, zip_data, force=force)
+                result = await deploy_zip_to_solution_path(
+                    db, solution, zip_path, force=force
+                )
                 await db.commit()
                 # S3 only after the DB is durable — a failed commit changes no running
                 # code (P1-c). Still inside the lock so finalize can't race another deploy.
@@ -1009,6 +1262,8 @@ async def _run_deploy_job(
         await _set_status("failed", "Deploy failed unexpectedly; see server logs.")
     else:
         await _set_status("succeeded", result=deploy_result)
+    finally:
+        _cleanup_file(zip_path)
 
 
 @router.post(
@@ -1037,12 +1292,13 @@ async def deploy_solution(
             detail="This install is git-connected; deploy is disabled (auto-pull is the only writer).",
         )
 
-    from src.services.solutions.zip_install import preview_zip
+    from src.services.solutions.zip_install import preview_zip_path
 
-    data = await file.read()
+    zip_path = await _spool_upload_to_temp(file, prefix="bifrost-solution-deploy-")
     try:
-        preview = preview_zip(data)
+        preview = preview_zip_path(zip_path)
     except (ValueError, zipfile.BadZipFile) as exc:
+        _cleanup_file(zip_path)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Invalid solution zip: {exc}",
@@ -1077,6 +1333,7 @@ async def deploy_solution(
         ).all()
         blockers = unpulled_blockers([(t, i) for t, i in pending_rows], manifest_ids)
         if blockers:
+            _cleanup_file(zip_path)
             detail = ", ".join(f"{t}:{i}" for t, i in blockers)
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1094,7 +1351,7 @@ async def deploy_solution(
     await ctx.db.commit()
     await ctx.db.refresh(job)
 
-    background_tasks.add_task(_run_deploy_job, job.id, solution_id, data, force=force)
+    background_tasks.add_task(_run_deploy_job, job.id, solution_id, zip_path, force=force)
     return SolutionDeployEnqueued(deploy_job_id=job.id)
 
 
@@ -1356,7 +1613,7 @@ async def install_preview(
     empty/absent → global NULL), the response also carries ``existing_install``
     + ``diff`` so the UI routes to UPGRADE instead of a second install (Task 22).
     """
-    from src.services.solutions.zip_install import preview_zip
+    from src.services.solutions.zip_install import preview_zip_path
 
     org_id: UUID | None = None
     if organization_id:
@@ -1368,14 +1625,16 @@ async def install_preview(
                 detail=f"Invalid organization_id: {organization_id}",
             ) from exc
 
-    data = await file.read()
+    zip_path = await _spool_upload_to_temp(file, prefix="bifrost-solution-preview-")
     try:
-        result = preview_zip(data)
+        result = preview_zip_path(zip_path)
     except (ValueError, zipfile.BadZipFile) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Invalid solution zip: {exc}",
         ) from exc
+    finally:
+        _cleanup_file(zip_path)
 
     return await _preview_to_dto(ctx, result, org_id)
 
@@ -1566,6 +1825,7 @@ async def install_solution(
     replace_secrets: Annotated[bool, FastapiForm()] = False,
     replace_data: Annotated[bool, FastapiForm()] = False,
     force: bool = False,
+    reactivate: bool = False,
 ) -> SolutionDTO:
     """Atomically install a Solution from a workspace zip.
 
@@ -1596,8 +1856,9 @@ async def install_solution(
         BadExportPassword,
         ContentCollision,
         GitConnectedInstallError,
+        InactiveInstallExists,
         UnmetDependency,
-        install_zip,
+        install_zip_path,
     )
 
     org_id: UUID | None = None
@@ -1623,11 +1884,11 @@ async def install_solution(
             detail="config_values must be a JSON object mapping key → value",
         )
 
-    data = await file.read()
+    zip_path = await _spool_upload_to_temp(file, prefix="bifrost-solution-install-")
     try:
-        solution = await install_zip(
+        solution = await install_zip_path(
             ctx.db,
-            data,
+            zip_path,
             organization_id=org_id,
             config_values=values,
             deployer_email=user.email,
@@ -1635,7 +1896,21 @@ async def install_solution(
             password=password,
             replace_secrets=replace_secrets,
             replace_data=replace_data,
+            reactivate=reactivate,
         )
+    except InactiveInstallExists as exc:
+        # An inactive install of this slug already exists in the target org.
+        # Return a structured 409 so the UI/CLI can prompt the user to either
+        # reactivate (pass ?reactivate=true) or hard-delete the install first.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "inactive_install_exists",
+                "solution_id": str(exc.solution_id),
+                "slug": exc.slug,
+                "message": str(exc),
+            },
+        ) from exc
     except UnmetDependency as exc:
         # A bundle imports a modules.X that isn't shipped — refuse before
         # anything lands, naming the missing module.
@@ -1682,4 +1957,6 @@ async def install_solution(
                 "Re-run the install to complete it (it is idempotent)."
             ),
         ) from exc
+    finally:
+        _cleanup_file(zip_path)
     return SolutionDTO.model_validate(solution)

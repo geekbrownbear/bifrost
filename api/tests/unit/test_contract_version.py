@@ -65,6 +65,7 @@ from src.models.contracts.solutions import (  # noqa: E402
     SolutionDeployEnqueued,
     SolutionDeployJobStatus,
 )
+from src.models.contracts.policy_rule import PolicyRuleCreate, PolicyRuleUpdate  # noqa: E402
 from src.models.contracts.tables import TableCreate, TableUpdate  # noqa: E402
 from src.models.contracts.users import RoleCreate, RoleUpdate  # noqa: E402
 from src.models.contracts.workflows import WorkflowUpdateRequest  # noqa: E402
@@ -110,6 +111,8 @@ _COMMAND_DTOS: list[type] = [
     EventSubscriptionUpdate,
     SolutionDeployEnqueued,
     SolutionDeployJobStatus,
+    PolicyRuleCreate,
+    PolicyRuleUpdate,
 ]
 
 #: Every request/response DTO the in-workflow SDK sends/parses against
@@ -160,7 +163,15 @@ EXPECTED_CONTRACT_FINGERPRINT = (
     # Solution deploy now uploads a workspace zip as multipart/form-data instead
     # of the legacy JSON bundle request body (2026-06-21).
     # CONTRACT_VERSION bumped to 6.
-    "574232b44f09b26868559f4346a4bf9f364473d2affe4780fbdef1a767fdb5d6"
+    #
+    # TablePolicies policies union widened to list[Policy | PolicyRuleRef] (2026-06-23).
+    # ADDITIVE: old CLIs send plain inline rules; PolicyRuleRef is a new optional
+    # variant — no old client is broken. Fingerprint refreshed only.
+    #
+    # PolicyRuleCreate + PolicyRuleUpdate added to CLI contract surface (2026-06-23).
+    # ADDITIVE: new entity group (policy-rule), no existing DTOs changed.
+    # Fingerprint refreshed only.
+    "4b9e5c8786bb8555000cb02744c501ef28b3dcf6e40257e4b0e7f7405177e12a"
 )
 
 

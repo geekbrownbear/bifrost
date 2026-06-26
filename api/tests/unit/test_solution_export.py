@@ -7,6 +7,7 @@ import base64
 import io
 import uuid
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -97,6 +98,7 @@ def _bundle() -> SolutionBundle:
                 "position": 0,
             }
         ],
+        file_locations=["reports", "invoices"],
     )
 
 
@@ -108,6 +110,14 @@ def _admin(db) -> tuple[ExecutionContext, UserPrincipal]:
         is_superuser=True,
     )
     return ExecutionContext(user=user, org_id=None, db=db), user
+
+
+def _response_bytes(response) -> bytes:  # noqa: ANN001
+    path = Path(response.path)
+    try:
+        return path.read_bytes()
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def test_export_round_trips_through_preview() -> None:
@@ -140,6 +150,7 @@ def test_export_round_trips_through_preview() -> None:
 
     assert [c["key"] for c in result.config_schemas] == ["API_KEY"]
     assert result.config_schemas[0]["required"] is True
+    assert result.file_locations == ["reports", "invoices"]
 
 
 def test_export_apps_round_trip_source_and_logo() -> None:
@@ -175,6 +186,13 @@ def test_export_python_source_verbatim() -> None:
 def test_export_is_deterministic() -> None:
     """Idempotent finalize retries must not churn bytes (fixed zip mtimes)."""
     assert build_workspace_zip(_bundle()) == build_workspace_zip(_bundle())
+
+
+def test_export_writes_files_yaml_top_level_locations() -> None:
+    with zipfile.ZipFile(io.BytesIO(build_workspace_zip(_bundle()))) as z:
+        payload = z.read(".bifrost/files.yaml").decode()
+
+    assert payload == "locations:\n- reports\n- invoices\n"
 
 
 def test_export_descriptor_omits_scope_regardless_of_org() -> None:
@@ -258,7 +276,7 @@ async def test_shareable_export_returns_stored_source_artifact(db_session) -> No
     ctx, user = _admin(db_session)
     response = await export_solution(sol.id, ctx, user, mode="shareable")
 
-    assert response.body == source_zip
+    assert _response_bytes(response) == source_zip
 
 
 @pytest.mark.e2e
@@ -299,7 +317,7 @@ async def test_full_export_overlays_live_payload_on_stored_source(
         password="pw",
     )
 
-    with zipfile.ZipFile(io.BytesIO(response.body)) as z:
+    with zipfile.ZipFile(io.BytesIO(_response_bytes(response))) as z:
         assert z.read("workflows/main.py").decode() == "def run():\n    return 'artifact'\n"
         blob = z.read(".bifrost/secrets.enc").decode()
     content = decode_secrets_blob(blob, password="pw")

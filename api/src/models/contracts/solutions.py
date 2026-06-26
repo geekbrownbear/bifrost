@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 SolutionScope = Literal["org", "global"]
 
@@ -76,6 +76,18 @@ class SolutionReadme(BaseModel):
     readme: str | None = None
 
 
+class SolutionEntityCounts(BaseModel):
+    """Per-install inventory counts for lightweight list/catalog views."""
+
+    workflows: int = 0
+    apps: int = 0
+    forms: int = 0
+    agents: int = 0
+    tables: int = 0
+    claims: int = 0
+    files: int = 0
+
+
 class Solution(BaseModel):
     """Read-shape returned by REST.
 
@@ -111,6 +123,10 @@ class Solution(BaseModel):
     # Recomputed by install_zip after each deploy so it reflects the install's
     # state without a separate /setup call. Defaults True (no declarations = complete).
     setup_complete: bool = True
+    # Lifecycle status. "active" = installed & live. "inactive" = uninstalled
+    # (status flip only — data frozen in place under solution_id, dormant).
+    status: str = "active"
+    entity_counts: SolutionEntityCounts = Field(default_factory=SolutionEntityCounts)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -156,6 +172,14 @@ class SolutionEntitySummary(BaseModel):
     created_at: datetime | None = None
 
 
+class SolutionFileSummary(BaseModel):
+    """Lightweight summary of one file owned by a solution install."""
+
+    location: str
+    path: str
+    size: int | None = None
+
+
 class SolutionEntities(BaseModel):
     """Everything one install owns + its config declaration/value status."""
 
@@ -166,6 +190,7 @@ class SolutionEntities(BaseModel):
     agents: list[SolutionEntitySummary] = Field(default_factory=list)
     claims: list[SolutionEntitySummary] = Field(default_factory=list)
     tables: list[SolutionEntitySummary] = Field(default_factory=list)
+    files: list[SolutionFileSummary] = Field(default_factory=list)
     configs: list[SolutionConfigStatus] = Field(default_factory=list)
     required_configs_unset: list[str] = Field(default_factory=list)
 
@@ -372,12 +397,12 @@ class SolutionInstallPreview(BaseModel):
 
 
 class SolutionDeleteSummary(BaseModel):
-    """Counts of what a DELETE did. Pure-code entities (workflows/apps/forms/
-    agents) and the install's config DECLARATIONS are deleted via DB cascade.
-    Data-bearing entities are ORPHANED, not deleted: owned tables (and their
-    documents) are detached and survive as ordinary org tables, and the
-    install's config VALUES are stamped with orphan provenance and survive.
-    The UI echoes these back to the operator."""
+    """Counts returned by a confirmed hard-delete (DELETE /{id}?confirm=<slug>).
+
+    All owned rows are removed via the existing ``solution_id ondelete=CASCADE``
+    FKs when the Solution row is deleted. The S3 ``solutions/{id}/`` prefix is
+    swept after the DB commit. No data is orphaned — this is the destructive path.
+    """
 
     solution_id: UUID
     workflows_deleted: int = 0
@@ -386,8 +411,27 @@ class SolutionDeleteSummary(BaseModel):
     agents_deleted: int = 0
     claims_deleted: int = 0
     config_declarations_deleted: int = 0
-    tables_orphaned: int = 0
-    config_values_orphaned: int = 0
+    tables_deleted: int = 0
+    files_swept: int = 0
+
+
+class SolutionDeletionSummary(BaseModel):
+    """Preview of what a hard-delete would destroy (GET /{id}/deletion-summary).
+
+    Returns counts per owned entity type so the confirmation modal can show the
+    operator what they are about to destroy before they type the slug.
+    """
+
+    solution_id: UUID
+    files: int = 0
+    tables: int = 0
+    workflows: int = 0
+    apps: int = 0
+    forms: int = 0
+    agents: int = 0
+    claims: int = 0
+    config_declarations: int = 0
+    events: int = 0
 
 
 class SolutionDeployEnqueued(BaseModel):
@@ -411,6 +455,66 @@ class SolutionDeployJobStatus(BaseModel):
     result: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
+
+
+SolutionExportJobStatus = Literal["pending", "running", "completed", "failed", "expired"]
+
+
+class SolutionExportOptions(BaseModel):
+    """Options for a durable async backup export of a solution install."""
+
+    include_configs: bool = True
+    include_secrets: bool = False
+    include_tables: bool = False
+    include_files: bool = False
+    password: str | None = None
+
+    @model_validator(mode="after")
+    def require_at_least_one_include(self) -> "SolutionExportOptions":
+        if not any(
+            (
+                self.include_configs,
+                self.include_secrets,
+                self.include_tables,
+                self.include_files,
+            )
+        ):
+            raise ValueError("At least one include_* option must be true")
+        return self
+
+
+class SolutionExportJobCreate(BaseModel):
+    """Request body for enqueueing a solution backup export job."""
+
+    options: SolutionExportOptions
+
+
+class SolutionExportJobPublic(BaseModel):
+    """Public state for a durable async solution backup export job."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    solution_id: UUID
+    organization_id: UUID | None = None
+    requested_by_id: UUID | None = None
+    status: SolutionExportJobStatus
+    progress_percent: int = 0
+    message: str | None = None
+    failure_message: str | None = None
+    artifact_size_bytes: int | None = None
+    artifact_sha256: str | None = None
+    expires_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    download_url: str | None = None
+
+
+class SolutionExportJobsList(BaseModel):
+    """Recent durable async backup export jobs for one Solution."""
+
+    jobs: list[SolutionExportJobPublic] = Field(default_factory=list)
 
 
 class SolutionCaptureRequest(BaseModel):
@@ -498,3 +602,8 @@ class SolutionSetupStatus(BaseModel):
 
     setup_complete: bool
     items: list[SolutionSetupItem]
+
+
+# ---------------------------------------------------------------------------
+# File job contracts
+# ---------------------------------------------------------------------------

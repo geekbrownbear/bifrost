@@ -90,6 +90,7 @@ from src.routers import (
     mcp_me_connections_router,
     mcp_oauth_callback_router,
     sdk_modules_router,
+    policy_rules_router,
 )
 
 # Configure logging
@@ -156,6 +157,19 @@ async def app_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 )
     except Exception as e:
         logger.warning(f"Solution deploy job reconciliation failed: {e}")
+
+    # Seed built-in policy rules (idempotent; must exist before any file prefix
+    # with {"$ref": "admin_bypass"} is created).
+    try:
+        from src.services.policy_rule_service import PolicyRuleService
+
+        session_factory = get_session_factory()
+        async with session_factory() as db:
+            await PolicyRuleService(db).seed_builtin_admin_bypass()
+            await db.commit()
+            logger.info("Built-in policy rules seeded")
+    except Exception as e:
+        logger.warning(f"Built-in policy rule seeding failed: {e}")
 
     # Reconcile file_index with S3 _repo/ in background
     from src.services.file_index_reconciler import reconcile_file_index
@@ -602,6 +616,7 @@ def create_app() -> FastAPI:
     app.include_router(mcp_me_connections_router)
     app.include_router(mcp_oauth_callback_router)
     app.include_router(sdk_modules_router)
+    app.include_router(policy_rules_router)
 
     # Mount MCP OAuth routes at root level (required by RFC 8414/9728)
     # These must be registered BEFORE the FastMCP ASGI mount

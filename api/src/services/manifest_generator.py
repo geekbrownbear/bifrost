@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -28,10 +29,13 @@ from src.models.orm.external_mcp import (
     MCPConnectionTool,
     MCPServer,
 )
+from src.models.orm.file_metadata import FileMetadata
 from src.models.orm.forms import Form, FormField, FormRole
 from src.models.orm.integrations import Integration, IntegrationConfigSchema, IntegrationMapping
 from src.models.orm.oauth import OAuthProvider
 from src.models.orm.organizations import Organization
+from src.models.orm.policy_rule import PolicyRule
+from src.models.orm.solution_file_location import SolutionFileLocation
 from src.models.orm.tables import Table
 from src.models.orm.users import Role
 from src.models.orm.workflow_roles import WorkflowRole
@@ -43,18 +47,28 @@ from bifrost.manifest import (
     ManifestConfig,
     ManifestCustomClaim,
     ManifestEventSource,
+    ManifestFilePolicy,
+    ManifestFiles,
     ManifestForm,
     ManifestIntegration,
     ManifestMCPConnection,
     ManifestMCPConnectionTool,
     ManifestMCPServer,
     ManifestOrganization,
+    ManifestPolicyRule,
     ManifestRole,
+    ManifestSolutionFile,
     ManifestTable,
     ManifestWorkflow,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _load_file_policy_model() -> Any:
+    from src.models.orm.file_metadata import FilePolicy
+
+    return FilePolicy
 
 
 # =============================================================================
@@ -177,9 +191,19 @@ def serialize_custom_claim(claim: CustomClaim) -> ManifestCustomClaim:
     return ManifestCustomClaim.from_row(claim)
 
 
+def serialize_policy_rule(rule: PolicyRule) -> ManifestPolicyRule:
+    """Serialize a PolicyRule ORM object to ManifestPolicyRule."""
+    return ManifestPolicyRule.from_row(rule)
+
+
 def serialize_table(table: Table) -> ManifestTable:
     """Serialize a Table ORM object to ManifestTable."""
     return ManifestTable.from_row(table)
+
+
+def serialize_file_policy(file_policy) -> ManifestFilePolicy:
+    """Serialize a file policy ORM object to ManifestFilePolicy."""
+    return ManifestFilePolicy.from_row(file_policy)
 
 
 def serialize_event_source(
@@ -413,10 +437,70 @@ async def generate_manifest(
     claims_list = claim_result.scalars().all()
 
     # ------------------------------------------------------------------
+    # Policy Rules (exclude is_builtin rows — built-ins are seeded at startup)
+    # ------------------------------------------------------------------
+    policy_rule_result = await db.execute(
+        select(PolicyRule)
+        .where(PolicyRule.is_builtin == False)  # noqa: E712
+        .order_by(PolicyRule.organization_id, PolicyRule.domain, PolicyRule.name)
+    )
+    policy_rules_list = policy_rule_result.scalars().all()
+
+    # ------------------------------------------------------------------
     # Tables
     # ------------------------------------------------------------------
     table_result = await db.execute(_scope(select(Table), Table).order_by(Table.name))
     tables_list = table_result.scalars().all()
+
+    # ------------------------------------------------------------------
+    # File policies
+    # ------------------------------------------------------------------
+    FilePolicy = _load_file_policy_model()
+    fp_query = select(FilePolicy).order_by(
+        FilePolicy.organization_id,
+        FilePolicy.location,
+        FilePolicy.path,
+    )
+    if solution_id is not None:
+        # Solution-scoped export: only this solution's file policies.
+        fp_query = fp_query.where(FilePolicy.solution_id == solution_id)
+    else:
+        # Workspace export: only non-solution rows (solution rows are deploy-owned).
+        fp_query = fp_query.where(FilePolicy.solution_id.is_(None))
+    file_policy_result = await db.execute(fp_query)
+    file_policies_list = file_policy_result.scalars().all()
+
+    # ------------------------------------------------------------------
+    # Solution file index (solution-scoped export only, metadata-only — no bytes)
+    # ------------------------------------------------------------------
+    solution_files_list: list[ManifestSolutionFile] = []
+    file_locations = ManifestFiles()
+    if solution_id is not None:
+        sf_result = await db.execute(
+            select(
+                FileMetadata.location,
+                FileMetadata.path,
+                FileMetadata.sha256,
+                FileMetadata.size_bytes,
+            )
+            .where(FileMetadata.solution_id == solution_id)
+            .order_by(FileMetadata.location, FileMetadata.path)
+        )
+        for row in sf_result.all():
+            solution_files_list.append(
+                ManifestSolutionFile(
+                    location=row.location,
+                    path=row.path,
+                    sha256=row.sha256 or "",
+                    size=row.size_bytes or 0,
+                )
+            )
+        fl_result = await db.execute(
+            select(SolutionFileLocation.location)
+            .where(SolutionFileLocation.solution_id == solution_id)
+            .order_by(SolutionFileLocation.position, SolutionFileLocation.location)
+        )
+        file_locations = ManifestFiles(locations=list(fl_result.scalars().all()))
 
     # ------------------------------------------------------------------
     # Event sources + subscriptions
@@ -505,9 +589,17 @@ async def generate_manifest(
             str(claim.id): serialize_custom_claim(claim)
             for claim in claims_list
         },
+        policy_rules={
+            str(rule.id): serialize_policy_rule(rule)
+            for rule in policy_rules_list
+        },
         tables={
             str(table.id): serialize_table(table)
             for table in tables_list
+        },
+        file_policies={
+            str(file_policy.id): serialize_file_policy(file_policy)
+            for file_policy in file_policies_list
         },
         events={
             str(es.id): serialize_event_source(
@@ -548,6 +640,8 @@ async def generate_manifest(
             )
             for server in mcp_servers_list
         },
+        files=file_locations,
+        solution_files=solution_files_list,
     )
 
     logger.info(
@@ -555,9 +649,13 @@ async def generate_manifest(
         f"{len(manifest.forms)} forms, {len(manifest.agents)} agents, "
         f"{len(manifest.apps)} apps, {len(manifest.integrations)} integrations, "
         f"{len(manifest.configs)} configs, {len(manifest.claims)} claims, "
+        f"{len(manifest.policy_rules)} policy_rules, "
         f"{len(manifest.tables)} tables, "
+        f"{len(manifest.file_policies)} file_policies, "
+        f"{len(manifest.files.locations)} file_locations, "
         f"{len(manifest.events)} events, "
-        f"{len(manifest.mcp_servers)} mcp_servers"
+        f"{len(manifest.mcp_servers)} mcp_servers, "
+        f"{len(manifest.solution_files)} solution_files"
     )
 
     return manifest

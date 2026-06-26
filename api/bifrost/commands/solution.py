@@ -838,6 +838,20 @@ def _collect_config_schemas(workspace: pathlib.Path) -> list[dict]:
     return entries
 
 
+def _collect_file_locations(workspace: pathlib.Path) -> list[str]:
+    """Read solution runtime file-location declarations from .bifrost/files.yaml."""
+    files_file = _bifrost_manifest(workspace, "files.yaml")
+    if files_file is None or not files_file.is_file():
+        return []
+    from bifrost.manifest import ManifestFiles
+
+    data = yaml.safe_load(files_file.read_text()) or {}
+    raw = data.get("locations") or []
+    if not isinstance(raw, list):
+        raise ValueError(".bifrost/files.yaml locations must be a list")
+    return ManifestFiles(locations=raw).locations
+
+
 def _collect_connection_schemas(workspace: pathlib.Path) -> list[dict]:
     """Read connection DECLARATIONS from .bifrost/connections.yaml (keyed by name).
 
@@ -1583,6 +1597,12 @@ def deploy_cmd(
     default=False,
     help="Overwrite existing table data when the zip carries conflicting rows.",
 )
+@click.option(
+    "--reactivate",
+    is_flag=True,
+    default=False,
+    help="Reactivate an existing inactive (uninstalled) install of the same slug rather than refusing.",
+)
 def install_cmd(
     zip_path: str,
     org: str | None,
@@ -1591,6 +1611,7 @@ def install_cmd(
     password: str | None,
     replace_secrets: bool,
     replace_data: bool,
+    reactivate: bool,
 ) -> None:
     """POST a Solution workspace zip to ``/api/solutions/install``.
 
@@ -1606,6 +1627,11 @@ def install_cmd(
     blob; supply ``--password`` to decrypt it.  On a 409 collision the server
     names the conflicting keys — re-run with ``--replace-secrets`` to overwrite.
     A wrong password returns 422.
+
+    If the slug already has an INACTIVE (uninstalled) install in the target org,
+    the server returns 409 with ``reason=inactive_install_exists``.  Pass
+    ``--reactivate`` to flip that install back to active and redeploy the bundle
+    atop the retained frozen data.
     """
     config_values: dict[str, str] = {}
     for pair in set_values:
@@ -1632,19 +1658,34 @@ def install_cmd(
             form["replace_secrets"] = "true"
         if replace_data:
             form["replace_data"] = "true"
+        url = "/api/solutions/install"
+        if reactivate:
+            url += "?reactivate=true"
         resp = await client.post(
-            "/api/solutions/install",
+            url,
             files={"file": (pathlib.Path(zip_path).name, zip_bytes, "application/zip")},
             data=form,
         )
         if resp.status_code == 409:
-            detail = resp.json().get("detail", resp.text)
-            click.echo(f"Install collision: {detail}", err=True)
-            click.echo(
-                "Re-run with --replace-secrets to overwrite conflicting config values, "
-                "or --replace-data for table data.",
-                err=True,
-            )
+            detail = resp.json().get("detail", {})
+            if isinstance(detail, dict) and detail.get("reason") == "inactive_install_exists":
+                click.echo(
+                    f"An inactive install of '{detail.get('slug')}' already exists "
+                    f"(id={detail.get('solution_id')}).",
+                    err=True,
+                )
+                click.echo(
+                    "Re-run with --reactivate to reactivate it, "
+                    "or delete the existing install first.",
+                    err=True,
+                )
+            else:
+                click.echo(f"Install collision: {detail}", err=True)
+                click.echo(
+                    "Re-run with --replace-secrets to overwrite conflicting config values, "
+                    "or --replace-data for table data.",
+                    err=True,
+                )
             return 1
         if resp.status_code == 422:
             detail = resp.json().get("detail", resp.text)
@@ -1680,19 +1721,37 @@ def install_cmd(
     help="Required for --mode full; encrypts the secrets blob.",
 )
 @click.option(
+    "--include-data",
+    "include_data",
+    is_flag=True,
+    default=False,
+    help="Include table row data and solution files in the encrypted tier. Requires --mode full.",
+)
+@click.option(
     "--out",
     "out_path",
     default=None,
     help="Output zip path (default: <slug>-<version>.zip in the current directory).",
 )
-def export_cmd(solution_ref: str, mode: str, password: str | None, out_path: str | None) -> None:
+def export_cmd(
+    solution_ref: str,
+    mode: str,
+    password: str | None,
+    include_data: bool,
+    out_path: str | None,
+) -> None:
     """GET /api/solutions/{id}/export and write the zip to disk.
 
     SOLUTION_REF may be a solution id (UUID) or a slug.  Slugs are resolved
     via the solutions list endpoint.
+
+    Use ``--include-data`` with ``--mode full`` to include table row data and
+    solution-owned file sidecars in the encrypted tier.
     """
     if mode == "full" and not password:
         raise click.UsageError("--mode full requires --password")
+    if include_data and mode != "full":
+        raise click.UsageError("--include-data requires --mode full")
 
     async def _run() -> int:
         import uuid as _uuid
@@ -1727,7 +1786,10 @@ def export_cmd(solution_ref: str, mode: str, password: str | None, out_path: str
 
         # Password rides in the POST body, never the URL query (query-string
         # secrets leak into access logs / proxies / history). mode is not secret.
+        # include_data is also not sensitive so it stays in the query.
         params: dict[str, str] = {"mode": mode}
+        if include_data:
+            params["include_data"] = "true"
         body: dict[str, str] = {}
         if password is not None:
             body["password"] = password

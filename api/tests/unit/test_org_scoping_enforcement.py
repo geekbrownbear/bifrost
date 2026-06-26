@@ -118,16 +118,8 @@ ALLOW_LIST_INLINE_ORG: set[tuple[str, str, str]] = {
     ('routers/roles.py', 'KnowledgeNamespaceRoleORM.organization_id == entry.organization_id,', 'KnowledgeNamespaceRole identity-entity filter (permanent)'),
     ('routers/solutions.py', 'set_keys_q = select(Config.key).where(Config.organization_id == sol.organization_id)', 'entities endpoint: install-scoped config-key existence read for value_set status (NOT cascade)'),
     ('routers/solutions.py', 'set_keys_q = select(Config.key).where(Config.organization_id.is_(None))', 'entities endpoint: global-scope config-key existence read for value_set status (NOT cascade)'),
-    ('routers/solutions.py', 'Config.organization_id == sol.organization_id', 'uninstall: install-scoped orphan-stamp UPDATE on config values (NOT cascade)'),
-    ('routers/solutions.py', 'else Config.organization_id.is_(None)', 'uninstall: global-scope orphan-stamp UPDATE on config values (NOT cascade)'),
-    ('routers/solutions.py', 'SolutionORM.organization_id == sol.organization_id', 'uninstall: find OTHER live installs declaring the same key in this org to skip stamping a shared value (NOT cascade)'),
-    ('routers/solutions.py', 'else SolutionORM.organization_id.is_(None)', 'uninstall: global-scope variant of the same shared-key guard (NOT cascade)'),
     ('routers/solutions.py', 'return model.organization_id.is_(None)  # type: ignore[attr-defined]', 'capture candidates: exact install-scope filter for loose entities (NOT cascade)'),
     ('routers/solutions.py', 'return model.organization_id == org_id  # type: ignore[attr-defined]', 'capture candidates: exact install-scope filter for loose entities (NOT cascade)'),
-    # X-Bifrost-App app-scoped solution table lookup (install-scoped, NOT org
-    # cascade).
-    ('routers/tables.py', 'Table.organization_id == target_org_id,', 'install-scoped solution table lookup: org arm'),
-    ('routers/tables.py', 'Table.organization_id.is_(None),', 'install-scoped solution table lookup: global arm'),
     ('routers/usage_reports.py', 'base_conditions.append(AIUsage.organization_id == filter_org_id)', 'identity-entity scope filter (permanent)'),
     ('routers/usage_reports.py', 'exec_conditions.append(Execution.organization_id == filter_org_id)', 'identity-entity scope filter (permanent)'),
     ('routers/usage_reports.py', 'workflow_query = workflow_query.where(AIUsage.organization_id == filter_org_id)', 'identity-entity scope filter (permanent)'),
@@ -246,6 +238,20 @@ IDENTITY_MODELS: set[str] = {
     # A Solution install belongs to a scope (organization_id) but is never
     # resolved by name with cascade — it is identity, like Organization.
     "Solution",
+    # Export jobs are durable history/artifact rows for a specific install and
+    # org scope. They are looked up by id, never resolved through cascade.
+    "SolutionExportJob",
+    # File policies resolve with the SAME org→global cascade-and-override as
+    # OrgScopedRepository (org-specific prefix wins; fall back to the global
+    # (org=NULL) prefix), so a global `shared/<prefix>` policy cascades to every
+    # org's users. They are allow-listed rather than routed through
+    # OrgScopedRepository because the resolution key is a *longest-path-prefix*
+    # match (FilePolicyService.load_policy), not the repo's exact by-name `get`;
+    # the cascade ARM itself reuses the canonical `org_id == X OR org_id IS NULL`
+    # shape. FileMetadata is the per-file companion row (created_by/timestamps),
+    # resolved by exact (org, location, path) — it carries no policy of its own.
+    "FileMetadata",
+    "FilePolicy",
 }
 
 
